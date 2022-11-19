@@ -1,0 +1,475 @@
+// Tradingview Version 18.0 - Volume: rVol v3
+
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © kurtsmock
+//@version=5
+
+// v15 - Added plot for newInterval to facilitate validating the indicator and match RCDV proper output
+// v16 - Added Active Boundaries
+//          Its the percentage away from vwap. Formal definition differs. Unlike in equities, there is no float. There's just open interest. This works for CME futures. But can't be used in any other asset class. 
+//          When not using futures it will go off of the minimum of: (5000 bars back or the number of bars in the rVol cycles.) So low timeframes will be limited in how far they're going back due to pine constraints.
+// v18 - Correct calculation of the Active Boundary Price Label. 
+
+// v3.0 6/15/22 - rVol
+
+indicator('rVol', precision=2)
+import kurtsmock/ArrayMatrixHUD/2 as sa
+import kurtsmock/PD/1 as pd
+////////////////////////////////////////
+// Inputs //////////////////////////////
+//////////////////////////////////////// {
+rv_g1 = 'Indicator Switches'
+rv_g2 = 'rVol Settings'
+rv_g3 = 'Better-er Volume Settings'
+rv_g4 = 'Volume Average Comparison/Bar Colors'
+rv_g5 = 'Validation Table Setting'
+tv    = 'Total Volume',     rv    = 'rVol'
+vpt   = 'Volume Per Tick',  zvol  = 'Z-Score of Ln(Volume)',   rcdv = 'Relative Cumulative Daily Volume', svol = 'Sum Cumulative Daily Volume', actv = "Active Boundary",  nan = 'None'
+tt1   = 'Check the box if the symbol\'s exchange adjusts timestamp for Daylight Savings Time.\n\nNOTE: Cryptocurrencies do not adjust for DST.\n\n The script has some logic to test if it is working properly, but you\'ll want to make sure you keep this in mind. It won\'t catch everything.'
+
+s_bvol      = input.bool(false, group=rv_g1, inline='a', title='Better Volume | ')
+s_rate      = input.bool(false, group=rv_g1, inline='a', title='Volume Rating | ')
+s_weit      = input.bool(false, group=rv_g1, inline='a', title='Weighted Volume')
+s_col       = input.bool(false, group=rv_g1, inline='b', title='Colored Bars |')
+s_val       = input.bool(false, group=rv_g1, inline='b', title='Validation Table | ')
+s_tab       = input.bool(false, group=rv_g1, inline='b', title='Legend Table')
+s_dlst      = input.bool(true , group=rv_g1,             title='Daylight Savings Time Switch',   tooltip=tt1)
+c_mode      = input.string( rv, group=rv_g1,             title='Volume Mode',                    options = [rv, tv])
+c_calc      = input.string(nan, group=rv_g1,             title='Additional Calculation',         options = [vpt, zvol, rcdv, svol, actv, nan])
+
+i_cycles    = input.int(    10, group=rv_g2,             title='rVol Cycles',                    minval=1) + 1
+
+i_bvLength  = input.int(    20, group=rv_g3,             title='Better-er Lookback')
+i_maLen     = input.int(    20, group=rv_g4,             title='Volume Moving Average Length')
+i_uv        = input.float( 2.2, group=rv_g4,             title='Ultra High Volume Ratio')
+i_vhv       = input.float( 1.8, group=rv_g4,             title='Very High Volume Ratio')
+i_hv        = input.float( 1.2, group=rv_g4,             title='High Volume Ratio')
+i_nv        = input.float( 0.8, group=rv_g4,             title='Normal Volume Ratio')
+i_lv        = input.float( 0.4, group=rv_g4,             title='Low Volume Ratio')
+// }
+
+////////////////////////////////////////
+// rVol ////////////////////////////////
+//////////////////////////////////////// {
+// -- Absolute time reference at beginning of chart {
+t = time("D")
+var START_BAR = 0
+if t != t[1] and START_BAR == 0 
+    START_BAR := bar_index
+
+var START_TIME = 0
+var START_HOUR = 0
+var START_MIN  = 0
+var START_SEC  = 0
+if bar_index == START_BAR and START_BAR > 0
+    START_TIME := time_close
+    START_HOUR := hour
+    START_MIN  := minute
+    START_SEC  := second
+
+// plot(START_BAR)
+// plot(START_TIME)
+// plot(START_HOUR)
+// plot(START_MIN)
+// plot(START_SEC)
+//}
+
+// -- Find Beginning Bar of Interval (Daily Open) {
+newInterval         = false
+var newTime         = int(na)
+var rollingDays     = 0
+var rollingBars     = 0
+var totalDays       = 0
+
+rollingBars += 1
+if rollingBars >= i_cycles
+    rollingBars := 0
+
+DST    = (time_close - nz(newTime) + (month >= 3 and month < 11 ? 3600000 : -3600000)) % 86400000
+notDST = (time_close - math.max(nz(newTime), START_TIME)) % 86400000
+newInt =  s_dlst and month >= 3 and month <= 11 ? 
+         (DST == 0 and notDST > DST and DST[1] > 0) or (notDST == 0 and DST > notDST) :
+          notDST == 0
+
+if newInt or t != t[1]
+    newInterval := true
+    newTime     := time_close
+    rollingDays += 1
+    totalDays   += 1
+if rollingDays >= i_cycles
+    rollingDays := 0
+
+curBarofDay      = timeframe.isseconds ? 0 : ta.barssince(newInterval)
+barsInSession    = timeframe.isintraday ? ((24 * 60) / timeframe.multiplier) : timeframe.multiplier
+barsInSession   := math.floor(barsInSession) == barsInSession and timeframe.isintraday ? barsInSession - 1 : math.floor(barsInSession)
+
+// plot(DST, color=color.purple)
+// plot(notDST)
+// plot(newInt ? 1 : 0, color=color.fuchsia)
+// plotchar(newInterval, char="*", location = location.bottom, size = size.large)
+// plot(rollingDays, color=color.orange)
+// plot(rollingBars, color=color.orange)
+// plot(curBarofDay, color=color.green)
+// plot(barsInSession, color=color.red)
+// plot(totalDays)
+//}
+
+var values = matrix.new<float>(i_cycles, barsInSession + 1, 0)
+if barstate.isconfirmed and totalDays > 2 and not(timeframe.isseconds)
+    matrix.set(values, rollingDays, math.min(curBarofDay, barsInSession), volume)
+else if barstate.isconfirmed and totalDays > 2 and timeframe.isseconds
+    matrix.set(values, rollingBars, 0, volume)
+
+histVolume = array.new_float()
+avgHistVol = 0.0
+if not(na(matrix.col(values, math.min(curBarofDay,barsInSession))))
+    histVolume := matrix.col(values, math.min(curBarofDay,barsInSession))
+    if not(na(array.avg(histVolume))) and barstate.isrealtime
+        avgHistVol := array.avg(histVolume)
+    else if not(na(array.avg(histVolume))) and barstate.ishistory
+        array.remove(histVolume, rollingDays)
+        avgHistVol := array.avg(histVolume)
+
+rVol = volume / avgHistVol
+_vol = c_mode == rv ? rVol : volume
+//}
+
+////////////////////////////////////////
+// RCDV, VPT, Z-Vol /////////////////////////
+//////////////////////////////////////// {
+sumVol  =   volume
+sumVol :=   newInterval ? sumVol : sumVol + sumVol[1]                   // total daily volume to this point in the day
+
+var valuesRCDV = matrix.new<float>(i_cycles, barsInSession + 1, 0)
+if barstate.isconfirmed and totalDays > 2
+    matrix.set(valuesRCDV, rollingDays, math.min(curBarofDay, barsInSession), sumVol)
+
+histRCDV = array.new_float()
+avgHistRCDV = 0.0
+sumHistRCDV = 0.0
+if not(na(matrix.col(valuesRCDV, math.min(curBarofDay,barsInSession))))
+    histRCDV := matrix.col(valuesRCDV, math.min(curBarofDay,barsInSession))
+    if not(na(array.avg(histRCDV)))
+        avgHistRCDV := array.avg(histRCDV)                               // average daily volume up to this point in the day
+        sumHistRCDV := array.sum(histRCDV)
+_rcdv = (sumVol / avgHistRCDV) - 1
+
+linePlace = c_calc == svol ? avgHistRCDV : na
+newLine = line.new(bar_index, linePlace, bar_index[10], linePlace, extend = extend.left, color = color.black, style = line.style_dashed, width = 1)
+line.delete(newLine[1])
+
+
+dist     = pd.tick("rg")
+logVol   = math.log(_vol)
+avgVol   = ta.sma(logVol, 1000)
+stdevVol = ta.stdev(logVol, 1000)
+zvolTime = timenow > time + ((time_close - time) * 0.30)                // Time delay for z-score of log(vol) to appear. Visually appealing and volume info before this point is not useful. 
+
+// -- active boundary
+s_useOI = input.bool(true, "Use Open Interest/Float")
+s_abVal = input.bool(false, "Show Active Boundary Price")
+quandl_root = syminfo.root == 'ZB' ? '020601' : syminfo.root == 'ZN' ? '043602' : syminfo.root == 'ZS' ? '005602' : syminfo.root == 'ZM' ? '026603' : syminfo.root == 'ZL' ? '007601' : syminfo.root == 'ZC' ? '002602' : syminfo.root == 'ZW' ? '001602' : syminfo.root == 'KE' ? '001612' : syminfo.root == 'HE' ? '054642' : syminfo.root == 'LE' ? '057642' : syminfo.root == 'GC' ? '088691' : syminfo.root == 'SI' ? '084691' : syminfo.root == 'HG' ? '085692' : syminfo.root == 'CL' ? '067651' : syminfo.root == 'HO' ? '022651' : syminfo.root == 'RB' ? '111659' : syminfo.root == 'NG' ? '023651' : syminfo.root == '6A' ? '232741' : syminfo.root == '6B' ? '096742' : syminfo.root == '6C' ? '090741' : syminfo.root == '6E' ? '099741' : syminfo.root == '6J' ? '097741' : syminfo.root == '6S' ? '092741' : syminfo.root == 'SB' ? '080732' : syminfo.root == 'KC' ? '083731' : syminfo.root == 'CC' ? '073732' : syminfo.root == 'CT' ? '033661' : syminfo.root == 'ES' ? '13874A' : syminfo.root == 'RTY' ? '239742' : syminfo.root == 'YM' ? '12460P' : syminfo.root == 'NQ' ? '209742' : syminfo.root == 'PA' ? '075651' : syminfo.root == 'PL' ? '076651' : syminfo.root == 'AUP' ? '191693' : syminfo.root == 'HRC' ? '192651' : syminfo.root == 'EH' ? '025651' : syminfo.root == 'BB' ? '06765T' : syminfo.root == 'ZR' ? '039601' : syminfo.root == 'ZO' ? '004603' : syminfo.root == 'DC' ? '052641' : syminfo.root == 'OJ' ? '040701' : syminfo.root == 'LBS' ? '058643' : syminfo.root == 'GF' ? '061641' : syminfo.root == 'SP' ? '138741' : syminfo.root == 'DJIA' ? '12460P' : syminfo.root == '6N' ? '112741' : syminfo.root == '6L' ? '102741' : syminfo.root == 'VX' ? '1170E1' : syminfo.root == '6M' ? '095741' : syminfo.root == '6R' ? '089741' : syminfo.root == '6Z' ? '122741' : syminfo.root == 'ZT' ? '042601' : syminfo.root == 'ZF' ? '044601' : ''
+quandl_code = 'QUANDL:CFTC/' + quandl_root + '_F_L_ALL'
+OI          = request.security(quandl_code + '|0', 'D', close)
+ 
+totalBars   = (barsInSession * i_cycles > 4999 ? 4999 : barsInSession * i_cycles)
+oiBarCnt    = 0 
+hlc3xVol    = 0.0
+volSum      = 0.0
+oiVolSum    = 0.0
+if s_useOI
+    totalBars := 0
+    for i = 0 to 2000 by 1
+        oiVolSum := oiVolSum + volume[i]
+        totalBars += 1
+        if oiVolSum > OI
+            break
+        else
+            continue
+    totalBars
+
+totalBarsAvg = ta.sma(totalBars, 1000)
+for i = 0 to totalBars by 1
+    volSum   := volSum + volume[i]
+    hlc3xVol := hlc3xVol + (volume*hlc3)[i]
+
+rollingVWAP =   hlc3xVol / volSum
+ab = (close / rollingVWAP - 1) * 100
+
+abPrice = math.round_to_mintick(  math.abs(  (close[1] * (-ab / 100)) + close  )  )
+label priceLabel = na
+if s_abVal and c_calc == actv
+    label.delete(priceLabel[1])
+    priceLabel := label.new(x=bar_index, y=ab, text=str.tostring(abPrice, format.mintick), xloc=xloc.bar_index, yloc=yloc.price, style=label.style_label_upper_left, textcolor=color.new(color.white, 0) )
+
+// -- Designate Plot Variable
+_vpt     = _vol / dist
+_zVol    = (logVol - avgVol) / stdevVol
+_vol    := c_calc == vpt ? _vpt : 
+           c_calc == zvol ? (zvolTime ? _zVol : 0) : 
+           c_calc == rcdv ? _rcdv :
+           c_calc == svol ? sumVol :
+           c_calc == actv ? ab : 
+           _vol
+//}
+
+
+
+////////////////////////////////////////
+// Volume Comparison With rVol /////////
+//////////////////////////////////////// {
+vma     = ta.sma(_vol, i_maLen)
+uhvMin  = vma * i_uv, vhvMin = vma * i_vhv, hvMin = vma * i_hv, nvMin = vma * i_nv, lvMin = vma * i_lv
+volUHV  = c_mode == tv or c_calc == vpt ? _vol >= uhvMin                   ? true : false : _vol >= i_uv                   ? true : false
+volVHV  = c_mode == tv or c_calc == vpt ? _vol >= vhvMin and _vol < uhvMin ? true : false : _vol >= i_vhv and _vol < i_uv  ? true : false
+volHV   = c_mode == tv or c_calc == vpt ? _vol >= hvMin  and _vol < vhvMin ? true : false : _vol >= i_hv  and _vol < i_vhv ? true : false
+volNV   = c_mode == tv or c_calc == vpt ? _vol >= nvMin  and _vol < hvMin  ? true : false : _vol >= i_nv  and _vol < i_hv  ? true : false
+volLV   = c_mode == tv or c_calc == vpt ? _vol >= lvMin  and _vol < nvMin  ? true : false : _vol >= i_lv  and _vol < i_nv  ? true : false
+volVLV  = c_mode == tv or c_calc == vpt ? _vol <  lvMin                    ? true : false : _vol <  i_lv                   ? true : false
+_col    = volUHV ? color.new(color.purple, 30) :
+          volVHV ? color.new(color.red, 30) :
+          volHV ? color.new(color.orange, 30) :
+          volNV ? color.new(color.green, 30) :
+          volLV ? color.new(color.blue, 30) : color.new(color.silver, 30)
+defcol  = color.new(color.gray, 50)
+//}
+
+// -- Volume Plot -- // {
+// Placed here to keep volume plot behind Better-er Volume Signals
+o_col =  (c_calc == zvol ? (close>open ? color.new(color.green, 30) : color.new(color.red, 30) ) : 
+          c_calc == rcdv ? (_rcdv > 0  ? color.new(color.green, 60) : color.new(color.red, 60) ) : 
+          c_calc == svol ? color.new(color.blue, 60)                                             : 
+          c_calc == actv ? (_vol > 0   ? color.new(color.green, 60) : color.new(color.red, 60) ) : _col)
+
+plot(_vol, style= c_calc==svol or c_calc==rcdv or c_calc==actv ? plot.style_area : plot.style_columns, color=s_col ? o_col : defcol)
+hline(c_calc == vpt or c_calc == zvol or c_calc == svol or c_calc == rcdv ? 0 : 1, linestyle=hline.style_dashed)
+plot(newInterval ? 0 : na, style = plot.style_circles, color = color.orange, linewidth = 4)
+//}
+
+////////////////////////////////////////
+// Better-er Volume ////////////////////
+//////////////////////////////////////// {
+rng         = high - low
+v           = _vol
+vBuy        = (close - low) / (high - low) * v
+vSell       = (high - close) / (high - low) * v
+vChurn      = v / rng
+vLow        = ta.lowest(v, i_bvLength)
+
+tClimaxUp   = vBuy   == ta.highest(vBuy, i_bvLength) ? 1 : 0
+tClimaxDn   = vSell  == ta.highest(vSell, i_bvLength) ? 1 : 0
+tChurn      = vChurn == ta.highest(vChurn, i_bvLength) ? 1 : 0
+tLow        = v      == vLow ? 1 : 0
+
+// -- Test Conditions
+climax_up   = tClimaxUp
+climax_down = tClimaxDn
+churn_bar   = tChurn
+def_bar     = not climax_up or climax_down or churn_bar
+climax_churn= tChurn and (tClimaxUp or tClimaxDn)
+low_vol     = tLow
+ccc         = climax_churn ? 1 : low_vol ? 2 : climax_up ? 3 : climax_down ? 4 : churn_bar ? 5 : def_bar ? 6 : 0
+
+// -- Characters
+clear       = color.new(color.white, 100)
+purple      = color.new(#730064, 0)
+blue        = color.new(#00c1e3, 0)
+green       = color.new(#39bd44, 0)
+red         = color.new(#ff391f, 0)
+orng        = color.new(#ffa200, 0)
+
+plotchar(s_bvol and ccc == 1 and vBuy > vSell ? climax_churn : na, 'Climax Up + Churn',   char='▲', location=location.top,    size=size.tiny, color=purple)
+plotchar(s_bvol and ccc == 1 and vSell > vBuy ? climax_churn : na, 'Climax Down + Churn', char='▼', location=location.top,    size=size.tiny, color=purple)
+plotchar(s_bvol and ccc == 3 and vBuy > vSell ? climax_up : na,    'Climax Up',           char='▲', location=location.top,    size=size.tiny, color=green)
+plotchar(s_bvol and ccc == 4 and vSell > vBuy ? climax_down : na,  'Climax Down',         char='▼', location=location.top,    size=size.tiny, color=red)
+plotchar(s_bvol and ccc == 5                  ? churn_bar : na,    'Churn',               char='■', location=location.top,    size=size.tiny, color=orng)
+plotchar(s_bvol and ccc == 2                  ? low_vol : na,      'Low Volume',          char='■', location=location.top,    size=size.tiny, color=blue)
+plotchar(s_bvol and ccc == 6                  ? def_bar : na,      'Default Bar',         char='■', location=location.bottom, size=size.tiny, color=clear)
+// }
+
+// -- Weighted Volume Plot -- // {
+plot(s_weit ? vBuy : na, "vBuy", style = plot.style_area, color = color.new(color.green,70))
+plot(s_weit ? vSell : na, "vSell", style = plot.style_area, color = color.new(color.red,70))
+//}
+
+////////////////////////////////////////
+// Volume Rating ///////////////////////
+//////////////////////////////////////// {
+// Bullish Volume Rating
+///////////////////////// {
+// -- Create Required Arrays
+var vcu = array.new_float(5, float(na))
+
+// -- Create Pivot High and Test
+p_climaxUp = ta.pivothigh(vBuy, 2, 2)
+testBull = ta.valuewhen(p_climaxUp, p_climaxUp, 0) != ta.valuewhen(p_climaxUp[1], p_climaxUp[1], 0) 
+
+// -- Add/Remove to/from Array
+if testBull and not(vBuy[2] == array.get(vcu, 0)) and vBuy[2] > vSell[2] 
+    array.unshift(vcu, vBuy[2])
+if array.size(vcu) > 5
+    array.pop(vcu)
+if (ccc == 1 or ccc == 3) and vBuy > vSell
+    array.fill(vcu, -1.0, 1, 5)
+    array.set(vcu, 0, vBuy)
+
+// -- Sort Array
+vcuSort = array.copy(vcu)
+array.sort(vcuSort, order.descending)
+if array.size(vcuSort) > 5
+    array.pop(vcuSort)
+
+// -- Rate Bullish Volume Pivot Height
+vcuRating = float(na)
+if vBuy[2] == array.get(vcuSort, 0)
+    vcuRating := 1
+else if vBuy[2] == array.get(vcuSort, 1)
+    vcuRating := 2
+else if vBuy[2] == array.get(vcuSort, 2)
+    vcuRating := 3
+else if vBuy[2] == array.get(vcuSort, 3)
+    vcuRating := 4
+else if vBuy[2] == array.get(vcuSort, 4)
+    vcuRating := 5
+else
+    vcuRating := float(na)
+// -- Bullish Volume Ratings
+plotchar(s_rate and vcuRating == 1 ? testBull : na, 'piv_u1', char='', text='1', location = location.top, color = color.green, offset=-2, size=size.tiny)
+plotchar(s_rate and vcuRating == 2 ? testBull : na, 'piv_u2', char='', text='2', location = location.top, color = color.green, offset=-2, size=size.tiny)
+plotchar(s_rate and vcuRating == 3 ? testBull : na, 'piv_u3', char='', text='3', location = location.top, color = color.green, offset=-2, size=size.tiny)
+plotchar(s_rate and vcuRating == 4 ? testBull : na, 'piv_u4', char='', text='4', location = location.top, color = color.green, offset=-2, size=size.tiny)
+plotchar(s_rate and vcuRating == 5 ? testBull : na, 'piv_u5', char='', text='5', location = location.top, color = color.green, offset=-2, size=size.tiny)
+//}
+
+// Bearish Volume Rating
+///////////////////////// {
+// -- Create Required Arrays
+var vcd = array.new_float(5, float(na))
+
+// -- Create Pivot High and Test
+p_climaxDn = ta.pivothigh(vSell, 2, 2)
+testBear = ta.valuewhen(p_climaxDn, p_climaxDn, 0) != ta.valuewhen(p_climaxDn[1], p_climaxDn[1], 0) 
+
+// -- Add/Remove to/from Array
+if testBear and not(vSell[2] == array.get(vcd, 0)) and vSell[2] > vBuy[2]
+    array.unshift(vcd, vSell[2])
+if array.size(vcd) > 5
+    array.pop(vcd)
+if (ccc == 1 or ccc == 4) and vSell > vBuy
+    array.fill(vcd, -1.0, 1, 5)
+    array.set(vcd, 0, vSell)
+
+// -- Sort Array
+vcdSort = array.copy(vcd)
+array.sort(vcdSort, order.descending)
+if array.size(vcdSort) > 5
+    array.pop(vcdSort)
+
+// -- Rate Bearish Volume Pivot Height
+vcdRating = float(na)
+if vSell[2] == array.get(vcdSort, 0)
+    vcdRating := 1
+else if vSell[2] == array.get(vcdSort, 1)
+    vcdRating := 2
+else if vSell[2] == array.get(vcdSort, 2)
+    vcdRating := 3
+else if vSell[2] == array.get(vcdSort, 3)
+    vcdRating := 4
+else if vSell[2] == array.get(vcdSort, 4)
+    vcdRating := 5
+else
+    vcdRating := float(na)
+
+// -- Bear Volume Ratings
+plotchar(s_rate and vcdRating == 1 ? testBear : na, 'piv_d1', char='', text='1', location = location.top, color = color.red, offset=-2, size=size.tiny)
+plotchar(s_rate and vcdRating == 2 ? testBear : na, 'piv_d2', char='', text='2', location = location.top, color = color.red, offset=-2, size=size.tiny)
+plotchar(s_rate and vcdRating == 3 ? testBear : na, 'piv_d3', char='', text='3', location = location.top, color = color.red, offset=-2, size=size.tiny)
+plotchar(s_rate and vcdRating == 4 ? testBear : na, 'piv_d4', char='', text='4', location = location.top, color = color.red, offset=-2, size=size.tiny)
+plotchar(s_rate and vcdRating == 5 ? testBear : na, 'piv_d5', char='', text='5', location = location.top, color = color.red, offset=-2, size=size.tiny)
+//}
+
+// Churn Rating
+///////////////////////// {
+// -- Create Required Arrays
+var vcc = array.new_float(5, float(na))
+
+// -- Create Pivot High and Test
+p_churn = ta.pivothigh(vChurn, 2, 2)
+testChurn = ta.valuewhen(p_churn, p_churn, 0) != ta.valuewhen(p_churn[1], p_churn[1], 0) 
+
+// -- Add/Remove to/from Array
+if testChurn and not(ccc == 1) and not(vChurn[2] == array.get(vcc, 0))
+    array.unshift(vcc, vChurn[2])
+if array.size(vcc) > 5
+    array.pop(vcc)
+if ccc == 5
+    array.fill(vcc, -1.0, 1, 5)
+    array.set(vcc, 0, vChurn)
+
+// -- Sort Array
+vccSort = array.copy(vcc)
+array.sort(vccSort, order.descending)
+if array.size(vccSort) > 5
+    array.pop(vccSort)
+
+// -- Rate Bearish Volume Pivot Height
+vccRating = float(na)
+if vChurn[2] == array.get(vccSort, 0)
+    vccRating := 1
+else if vChurn[2] == array.get(vccSort, 1)
+    vccRating := 2
+else if vChurn[2] == array.get(vccSort, 2)
+    vccRating := 3
+else if vChurn[2] == array.get(vccSort, 3)
+    vccRating := 4
+else if vChurn[2] == array.get(vccSort, 4)
+    vccRating := 5
+else
+    vccRating := float(na)
+
+// -- Churn Volume Ratings
+plotchar(s_rate and vccRating == 1 ? testChurn : na, 'piv_c1', char='', text='1', location = location.bottom, color = color.black, offset=-2, size=size.tiny)
+plotchar(s_rate and vccRating == 2 ? testChurn : na, 'piv_c2', char='', text='2', location = location.bottom, color = color.black, offset=-2, size=size.tiny)
+plotchar(s_rate and vccRating == 3 ? testChurn : na, 'piv_c3', char='', text='3', location = location.bottom, color = color.black, offset=-2, size=size.tiny)
+plotchar(s_rate and vccRating == 4 ? testChurn : na, 'piv_c4', char='', text='4', location = location.bottom, color = color.black, offset=-2, size=size.tiny)
+plotchar(s_rate and vccRating == 5 ? testChurn : na, 'piv_c5', char='', text='5', location = location.bottom, color = color.black, offset=-2, size=size.tiny)
+//}
+//}
+
+////////////////////////////////////////
+// Table Color Legend //////////////////
+//////////////////////////////////////// {
+ip_col = color.new(color.blue, 90)
+var table ip = table.new(position.middle_right, columns=3, rows=8, bgcolor=ip_col, frame_color=color.black, frame_width=1, border_color=color.black, border_width=1)
+if s_tab
+    table.cell(ip, 1, 1, 'Better-er Volume',    text_color=#000000,      text_halign=text.align_center, text_size=size.small)
+    table.cell(ip, 1, 2, '▲ Climax Up+Chrn',    text_color=#9e0089,      text_halign=text.align_right,  text_size=size.small)
+    table.cell(ip, 1, 3, '▼ Climax Down+Chrn',  text_color=#9e0089,      text_halign=text.align_right,  text_size=size.small)
+    table.cell(ip, 1, 4, '▲ Climax Up',         text_color=#39bd44,      text_halign=text.align_right,  text_size=size.small)
+    table.cell(ip, 1, 5, '▼ Climax Down',       text_color=#ff391f,      text_halign=text.align_right,  text_size=size.small)
+    table.cell(ip, 1, 6, '■ Low Volume',        text_color=#00c1e3,      text_halign=text.align_right,  text_size=size.small)
+    table.cell(ip, 1, 7, '■ Churn',             text_color=#ffa200,      text_halign=text.align_right,  text_size=size.small)
+    
+    table.cell(ip, 2, 1, 'Volume Threshold',    text_color=#000000,      text_halign=text.align_center, text_size=size.small)
+    table.cell(ip, 2, 2, 'Ultra High Volume',   text_color=color.purple, text_halign=text.align_right,  text_size=size.small)
+    table.cell(ip, 2, 3, 'Very High Volume',    text_color=color.red,    text_halign=text.align_right,  text_size=size.small)
+    table.cell(ip, 2, 4, 'High Volume',         text_color=color.orange, text_halign=text.align_right,  text_size=size.small)
+    table.cell(ip, 2, 5, 'Normal Volume',       text_color=color.green,  text_halign=text.align_right,  text_size=size.small)
+    table.cell(ip, 2, 6, 'Low Volume',          text_color=color.blue,   text_halign=text.align_right,  text_size=size.small)
+    table.cell(ip, 2, 7, 'Very Low Volume',     text_color=color.silver, text_halign=text.align_right,  text_size=size.small)
+//}
+
+////////////////////////////////////////
+// Validate Volume Values //////////////
+//////////////////////////////////////// {
+
+i_valOff = input.int(0, group=rv_g5, title='Validation Table Offset', minval=0)
+offset   = i_valOff                       
+if s_val 
+    sa.viewArray(histVolume, position.top_right, size.small, 10, totalDays > 2, offset)
+    tz = table.new(position.top_center,1,1)
+    table.cell(tz, 0,0,syminfo.timezone)
+
+plot(s_val ? totalBars: na, "Validation of Bars Back for AB", color=color.new(color.orange,0))
+plotchar(s_val ? newInterval : na, char="*", location = location.bottom, size = size.normal)
+//}
