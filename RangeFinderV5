@@ -1,0 +1,195 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © kurtsmock
+
+//@version=5
+indicator(title='PA: Range Finder v4', shorttitle='Range', overlay=true, max_bars_back=4999, max_lines_count=500)
+import kurtsmock/everything/12 as e
+// -- Script Strings: Tooltips and GroupID {
+t1 = 'A range is defined as a price that consecutive bars pass through. The range width determines how many consecutive bars must pass through the same price for \'Range Found\' = True.' + '\n' + '\n' + 'The Price level is determined by the close price \'Range Width\' bars back. So with default 5, the close price 5 bars ago is the level that will ID a range'
+t2 = 'Start lines on X Bars Back (Generally set to the same as \'Bars Back\' input.)'
+t3 = 'Take OHLC values from X Bars Back once range is confirmed (Generally Range Width - 1. The bar after the range began)'
+t4 = 'Note: When Overlap Condition = \'No Overlap, Show Newest\' is selected, older overlapping orderblocks are set to \'na\' in the array. Thus the default value of 10 may only show 3 orderblocks because the other 7 values may be \'na.\'' + '\n' + '\n' + 'By increasing the value of this input, more orderblocks will be displayed.'
+t5 = 'Note: If HTF is set to a timeframe lower than the timeframe being viewed on the chart, no orderblocks will be displayed.'
+r_g01 = 'Range Definition'
+r_g02 = 'Define Orderblock Parameters'
+r_g03 = 'Switches'
+c1 = 'Highs'
+c2 = 'Lows'
+c3 = 'EQ'
+c4 = '0.618'
+c5 = 'Scalp Lvls'
+c6 = 'NA'
+// }
+
+// -- Inputs {
+// -- Customization of Range Definition. 
+i_tf  = input.timeframe('15',    'HTF',                tooltip=t5, group=r_g01)
+i_rw  = input.int(5,             'Range Width',        tooltip=t1, group=r_g01, minval=3, maxval=100)
+i_bbv = input.int(4,             'Bars Back',          tooltip=t3, group=r_g01, minval=1)
+i_bbo = input.int(4,             'Bars Back Offset',   tooltip=t2, group=r_g01, minval=0)
+// -- Customization of how many lines to display
+i_lin = input.string('High/Low', 'Choose Range Boundary (Lines)',  group=r_g02, options=['High/Low', 'Open/Close'])
+i_cl  = input.string(c6,         'Choose Level',                   group=r_g02, options=[c1, c2, c3, c4, c5, c6])
+s_hi  = input.bool(true,         'High  |',            inline='i', group=r_g02)
+s_lo  = input.bool(true,         'Low  |',             inline='i', group=r_g02)
+s_eq  = input.bool(false,        'EQ  |',              inline='i', group=r_g02)
+i_fl  = input.int(10,            'Max Number of Lines',tooltip=t4, group=r_g02, minval=1, maxval=250)
+i_co  = input(#3b3b3b,         'Choose Line Color',              group=r_g02)
+i_lw  = input.int(1,             'Line Width',                     group=r_g02, minval=1, maxval=4)
+i_ex  = input(false,             'Extend Lines',                   group=r_g02)
+o_ex  = i_ex ? extend.right : extend.none
+// }
+
+// -- Script Data Processing {
+// -- Determine Barsback Offset on viewing timeframe for htf ranges
+_solvebarsback(string _res_s, int _len_i) =>
+    // -- Function Code {
+    if timeframe.isintraday and str.tonumber(_res_s) < timeframe.multiplier
+        runtime.error("Timeframe Chosen Is Lower Than Viewing Resolution. Increase Resolution TF in Settings")
+    num = 0.0, min = 0.0, view = 0,  bb = 0,  join = ''
+    view := timeframe.isdaily   ? timeframe.multiplier * 1440  : 
+             timeframe.isweekly  ? timeframe.multiplier * 10080 : 
+             timeframe.ismonthly ? month == 1 or month == 3 or month == 5 or month == 7 or month == 8 or month == 10 or month == 12 ? timeframe.multiplier * 31 * 1440 : 
+                                   month == 2 ? year % 4 == 0 and year % 100 == 0 and year % 400 == 0 ?                               timeframe.multiplier * 29 * 1440 : timeframe.multiplier * 28 * 1440 : 
+                                   timeframe.multiplier * 30 * 1440 : 
+             timeframe.multiplier
+    if _res_s == 'Same as symbol' or _res_s == ''
+        min := view
+    else
+        string[] _c = str.split(_res_s, '')
+        size = array.size(_c), last = array.pop(_c)
+        if last == 'D' or last == 'W' or last == 'M'
+            join := array.join(_c, '')
+        else
+            join := array.join(_c, '') + last
+        num := str.tonumber(join)
+
+        min := last == 'D' ? num * 1440  : 
+               last == 'W' ? num * 10080 : 
+               last == 'M' ? month == 1 or month == 3 or month == 5 or month == 7 or month == 8 or month == 10 or month == 12 ? num * 31 * 1440 : 
+                             month == 2 ? year % 4 == 0 and year % 100 == 0 and year % 400 == 0 ? num * 29 * 1440 : num * 28 * 1440             : 
+                             num * 30 * 1440 : 
+               num
+    bb := int(math.floor(min / view * _len_i))
+    //}
+    [view, min, bb]
+[view,  min,  bb_off]  = _solvebarsback(i_tf, i_rw + 1)
+[view2, min2, bb_off2] = _solvebarsback(i_tf, 1)
+// -- Condition True when a new bar on set timeframe occurs
+tf = timeframe.change(i_tf)
+
+// -- Call Price Data
+levelHi    = request.security(syminfo.tickerid, i_tf, high,                  gaps=barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+levelLo    = request.security(syminfo.tickerid, i_tf, low,                   gaps=barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+levelHiOC  = request.security(syminfo.tickerid, i_tf, math.max(open, close), gaps=barmerge.gaps_off, lookahead = barmerge.lookahead_off) // Level for line and range qualifying data
+levelLoOC  = request.security(syminfo.tickerid, i_tf, math.min(open, close), gaps=barmerge.gaps_off, lookahead = barmerge.lookahead_off) // Level for line and range qualifying data
+srcHL2     = request.security(syminfo.tickerid, i_tf, hl2[i_rw],             gaps=barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+srcClose   = request.security(syminfo.tickerid, i_tf, close[i_rw],           gaps=barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+
+// -- Set Arrays
+// When a new HTF candle opens, lvls are pushed into these arrays to test for presence of a range
+var check_hiOC = array.new_float(i_rw)
+var check_loOC = array.new_float(i_rw)
+var check_hihi = array.new_float(i_rw)
+var check_lolo = array.new_float(i_rw)
+// When a new range is found and overlapping + timing conditions are met, high price, low price, and lines are pushed into these arrays
+var hi_price = array.new_float(i_fl, 0)
+var lo_price = array.new_float(i_fl, 0)
+var barIndex = array.new_int(i_fl, 0)
+var hi_lines = array.new_line(i_fl, line(na))
+var lo_lines = array.new_line(i_fl, line(na))
+var eq_lines = array.new_line(i_fl, line(na))
+var f1_lines = array.new_line(i_fl, line(na))
+var f2_lines = array.new_line(i_fl, line(na))
+var f3_lines = array.new_line(i_fl, line(na))
+
+// -- Fill price data arrays with test data
+if tf
+    array.unshift(check_hiOC, levelHiOC)
+    array.unshift(check_loOC, levelLoOC)
+    array.unshift(check_hihi, levelHi)
+    array.unshift(check_lolo, levelLo)
+if array.size(check_hiOC) > i_rw
+    array.pop(check_hiOC)
+    array.pop(check_loOC)
+    array.pop(check_hihi)
+    array.pop(check_lolo)
+
+// -- Set Prices that will be applied when range is found
+highestOC = array.max(check_hiOC)
+lowestOC  = array.min(check_loOC)
+highestHi = array.max(check_hihi)
+lowestLo  = array.min(check_lolo)
+hiPrice   = i_lin == "High/Low" ? highestHi : highestOC
+loPrice   = i_lin == "High/Low" ? lowestLo  : lowestOC 
+leveleq   = ((hiPrice - loPrice) / 2)    + loPrice
+level75   = ( hiPrice - loPrice) * 0.618 + loPrice
+level80   = ( hiPrice - loPrice) * 0.85  + loPrice
+level20   = ( hiPrice - loPrice) * 0.15  + loPrice
+//}
+
+// -- Range Logic {
+noOverlap = true
+if tf and (hiPrice <= array.get(hi_price, 0)  and hiPrice  >= array.get(lo_price, 0)) or 
+          (loPrice <= array.get(hi_price, 0)  and loPrice  >= array.get(lo_price, 0)) or 
+          (loPrice <= array.get(hi_price, 0)  and hiPrice  >= array.get(lo_price, 0)) 
+    // The above may be true even if the prior range is many bars to the left and not active anymore
+    // However, the bar_index of last bar of the range is stored in barIndex[].
+    // Test to see if the new lines would overlap with prior range if that range is still active
+    if bar_index < array.get(barIndex, 0) + bb_off + bb_off2
+        noOverlap := false
+
+// -- Test Price Data Arrays for an Orderblock
+// Definition:
+//      If the highest low in the lookback is BELOW the Source Bar and the lowest high is ABOVE the Source Bar
+//      then price has passed through the Source Bar Price (close OR hl2) on every bar since the Source Bar. Price is trapped in a range.
+// Final Qualifier: 
+//      Bar on which range is discovered has to close INSIDE of the source bar's high and low, which prevents outside bars breaking the range for triggering ranges.
+// Determine lowest high and highest low value in lookback range to determine if price is in a qualifying range
+lowestHi  = array.min(check_hihi) 
+highestLo = array.max(check_lolo)
+inRange   = false
+rngCond   = ((lowestHi > srcClose and highestLo < srcClose) or (lowestHi > srcHL2 and highestLo < srcHL2)) and close < high[i_rw] and close > low[i_rw]
+if tf and noOverlap and inRange
+    inRange := true
+// }
+
+// -- Script Display Processing {
+// -- Updates Array on any new ranges that are disovered.
+var stopTrack = true
+if tf and inRange
+    stopTrack := false
+    array.unshift(hi_price, hiPrice)
+    array.unshift(lo_price, loPrice)
+    array.unshift(barIndex, bar_index)
+    array.unshift(hi_lines, s_hi       ? line.new(bar_index[bb_off - bb_off2], hiPrice, bar_index, hiPrice, extend=o_ex, style=line.style_solid,  color=i_co, width=i_lw) : line(na))
+    array.unshift(lo_lines, s_lo       ? line.new(bar_index[bb_off - bb_off2], loPrice, bar_index, loPrice, extend=o_ex, style=line.style_solid,  color=i_co, width=i_lw) : line(na))
+    array.unshift(eq_lines, s_eq       ? line.new(bar_index[bb_off - bb_off2], leveleq, bar_index, leveleq, extend=o_ex, style=line.style_dotted, color=i_co, width=i_lw) : line(na))
+    array.unshift(f1_lines, i_cl == c4 ? line.new(bar_index[bb_off - bb_off2], level75, bar_index, level75, extend=o_ex, style=line.style_dotted, color=i_co, width=i_lw) : line(na))
+    array.unshift(f2_lines, i_cl == c5 ? line.new(bar_index[bb_off - bb_off2], level80, bar_index, level80, extend=o_ex, style=line.style_dotted, color=i_co, width=i_lw) : line(na))
+    array.unshift(f3_lines, i_cl == c5 ? line.new(bar_index[bb_off - bb_off2], level20, bar_index, level20, extend=o_ex, style=line.style_dotted, color=i_co, width=i_lw) : line(na))
+
+// -- Remove index from end of line array and deletes line when new value is added to the beginning of the line array and array exceeds "Max Lines" argument
+if array.size(hi_lines) > i_fl
+    a = array.pop(hi_lines), line.delete(a)
+    b = array.pop(lo_lines), line.delete(b)
+    c = array.pop(eq_lines), line.delete(c)
+    d = array.pop(f1_lines), line.delete(d)
+    e = array.pop(f2_lines), line.delete(e)
+    f = array.pop(f3_lines), line.delete(f)
+    array.pop(hi_price)
+    array.pop(lo_price)
+    array.pop(barIndex)
+
+// Logic to extend lines as price continues in the range. Once close is OUTSIDE of range, range terminates. 
+if close <= array.get(hi_price, 0) and close >= array.get(lo_price, 0) and not stopTrack
+    line.set_x2(array.get(hi_lines, 0), bar_index)
+    line.set_x2(array.get(lo_lines, 0), bar_index)
+    line.set_x2(array.get(eq_lines, 0), bar_index)
+    line.set_x2(array.get(f1_lines, 0), bar_index)
+    line.set_x2(array.get(f2_lines, 0), bar_index)
+    line.set_x2(array.get(f3_lines, 0), bar_index)
+    array.set(barIndex, 0, bar_index)
+else if close < array.get(lo_price,0) or close > array.get(hi_price,0) and not stopTrack
+    stopTrack := true
+//}
